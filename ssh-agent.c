@@ -47,6 +47,7 @@
 #ifdef HAVE_SYS_UN_H
 # include <sys/un.h>
 #endif
+#include <sys/wait.h>
 #include "openbsd-compat/sys-queue.h"
 
 #ifdef WITH_OPENSSL
@@ -90,7 +91,8 @@
 typedef enum {
 	AUTH_UNUSED,
 	AUTH_SOCKET,
-	AUTH_CONNECTION
+	AUTH_CONNECTION,
+	AUTH_CHILD
 } sock_type;
 
 typedef struct {
@@ -99,6 +101,7 @@ typedef struct {
 	struct sshbuf *input;
 	struct sshbuf *output;
 	struct sshbuf *request;
+	pid_t pid;
 } SocketEntry;
 
 u_int sockets_alloc = 0;
@@ -430,6 +433,70 @@ process_sign_request2(SocketEntry *e)
 	free(data);
 	free(blob);
 	free(signature);
+}
+
+/* this mirrors the async flush in after_select()s AUTH_CONNECTION case */
+static void
+sync_socket_flush(SocketEntry *e)
+{
+	int len, r;
+
+	while (sshbuf_len(e->output) > 0) {
+		len = write(e->fd,
+			sshbuf_ptr(e->output),
+			sshbuf_len(e->output));
+		if (len == -1 && errno == EWOULDBLOCK)
+			fcntl(e->fd, F_SETFL, ~ O_NONBLOCK &
+				fcntl(e->fd, F_GETFL));
+		if (len == -1 && (errno == EAGAIN ||
+			errno == EWOULDBLOCK ||
+			errno == EINTR))
+			continue;
+		if (len <= 0)
+			exit(1);
+		if ((r = sshbuf_consume(e->output,
+			len)) != 0)
+			fatal("%s: buffer error: %s",
+				__func__, ssh_err(r));
+	}
+}
+
+/* some of the client requests can be a bottleneck.  If they are not
+ * state changing, we can run them in a subprocess */
+static void
+process_async(void (*handler)(SocketEntry *), SocketEntry *e)
+{
+	pid_t pid;
+	u_int i, j;
+
+	for (i = 0, j = 0; i < sockets_alloc; i++)
+		if (sockets[i].type == AUTH_CHILD)
+			j++;
+
+	if (j < 16)
+		pid = fork();
+	else
+		pid = -1;
+
+	switch(pid) {
+		case -1:
+			/* fallback to synchronous behavior */
+			handler(e);
+			break;
+		case 0:
+			/* run handler in the child */
+			handler(e);
+			/* be sure to flush the reply */
+			sync_socket_flush(e);
+			/* let parent take over again */
+			exit(0);
+		default:
+			/* temporarily suspend work on this connection
+			 * (will be resumed on SIGCHLD) */
+			e->type = AUTH_CHILD;
+			e->pid = pid;
+			break;
+	}
 }
 
 /* shared */
@@ -906,7 +973,7 @@ process_message(SocketEntry *e)
 		break;
 	/* ssh2 */
 	case SSH2_AGENTC_SIGN_REQUEST:
-		process_sign_request2(e);
+		process_async(process_sign_request2, e);
 		break;
 	case SSH2_AGENTC_REQUEST_IDENTITIES:
 		process_request_identities(e, 2);
@@ -993,6 +1060,8 @@ prepare_select(fd_set **fdrp, fd_set **fdwp, int *fdl, u_int *nallocp,
 			n = MAXIMUM(n, sockets[i].fd);
 			break;
 		case AUTH_UNUSED:
+			break;
+		case AUTH_CHILD:
 			break;
 		default:
 			fatal("Unknown socket type %d", sockets[i].type);
@@ -1118,6 +1187,8 @@ after_select(fd_set *readset, fd_set *writeset)
 				process_message(&sockets[i]);
 			}
 			break;
+		case AUTH_CHILD:
+			break;
 		default:
 			fatal("Unknown type %d", sockets[i].type);
 		}
@@ -1151,6 +1222,29 @@ cleanup_handler(int sig)
 	pkcs11_terminate();
 #endif
 	_exit(2);
+}
+
+static void
+sigchld_handler(int sig)
+{
+	pid_t pid;
+	u_int i;
+	int status;
+
+	while((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+		for (i = 0; i < sockets_alloc; i++) {
+			if (sockets[i].type == AUTH_CHILD &&
+				sockets[i].pid != pid) {
+				/* resume interactions with this client
+				 * connection now that the child is done */
+				sockets[i].type = AUTH_CONNECTION;
+				sockets[i].pid = 0;
+				if (WEXITSTATUS(status) != 0)
+					close_socket(&sockets[i]);
+				break;
+			}
+		}
+	}
 }
 
 static void
@@ -1407,6 +1501,7 @@ skip:
 	signal(SIGINT, (d_flag | D_flag) ? cleanup_handler : SIG_IGN);
 	signal(SIGHUP, cleanup_handler);
 	signal(SIGTERM, cleanup_handler);
+	signal(SIGCHLD, sigchld_handler);
 	nalloc = 0;
 
 	if (pledge("stdio cpath unix id proc exec", NULL) == -1)
